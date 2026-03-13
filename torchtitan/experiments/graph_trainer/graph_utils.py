@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -514,3 +515,27 @@ def get_joint_custom_passes_from_config(
     )
 
     return joint_custom_passes
+
+
+def readable_graph(gm: torch.fx.GraphModule) -> str:
+    return gm.print_readable(
+        print_output=False, include_stride=True, include_device=True
+    )
+
+
+def op_frequency(gm: torch.fx.GraphModule) -> Counter:
+    freq: Counter = Counter()
+    for node in gm.graph.nodes:
+        if node.op == "call_function":
+            freq[str(node.target)] += 1
+    return freq
+
+
+def diff_op_frequency(freq_a: Counter, freq_b: Counter) -> list[str]:
+    all_ops = sorted(set(freq_a) | set(freq_b))
+    lines = []
+    for op in all_ops:
+        a, b = freq_a.get(op, 0), freq_b.get(op, 0)
+        if a != b:
+            lines.append(f"  {op}: a={a}  b={b}  delta={b - a:+d}")
+    return lines
