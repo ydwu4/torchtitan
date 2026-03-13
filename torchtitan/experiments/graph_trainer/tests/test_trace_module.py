@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import unittest
 
 import torch
@@ -253,6 +254,219 @@ class TestTraceDTensor(unittest.TestCase):
         self.assertTrue(torch.equal(loss_ref.full_tensor(), loss_tr.full_tensor()))
         for gr, gt in zip(grads_ref, grads_tr, strict=True):
             self.assertTrue(torch.equal(gr.full_tensor(), gt.full_tensor()))
+
+
+@contextlib.contextmanager
+def _use_raw_flex_attn():
+    from torch.nn.attention.flex_attention import flex_attention as raw_flex_attention
+
+    from torchtitan.models.common.attention import FlexAttentionWrapper
+
+    original = FlexAttentionWrapper._compiled_flex_attn
+    FlexAttentionWrapper._compiled_flex_attn = staticmethod(raw_flex_attention)
+    try:
+        yield
+    finally:
+        FlexAttentionWrapper._compiled_flex_attn = original
+
+
+def _run_bitwise_test(
+    model_ref,
+    model_copy,
+    fwd_args,
+    labels,
+    check_collective_ops=False,
+    num_steps=5,
+    lr=1e-3,
+):
+    train_step_ref = TrainStepModule(model_ref, get_loss)
+
+    with _use_raw_flex_attn():
+        traced_result = trace_module(train_step_ref, (*fwd_args, labels))
+
+    if check_collective_ops:
+        ag = sum(
+            1
+            for n in traced_result.gm.graph.nodes
+            if "all_gather_into_tensor" in str(n.target)
+        )
+        rs = sum(
+            1
+            for n in traced_result.gm.graph.nodes
+            if "reduce_scatter_tensor" in str(n.target)
+        )
+        assert (
+            ag > 0 and rs > 0
+        ), f"Expected collective ops in FSDP graph (ag={ag}, rs={rs})"
+
+    opt_ref = torch.optim.Adam(model_ref.parameters(), lr=lr)
+    opt_copy = torch.optim.Adam(model_copy.parameters(), lr=lr)
+
+    for step in range(1, num_steps + 1):
+        with _use_raw_flex_attn():
+            logits_ref = model_ref(*fwd_args)
+        loss_ref = get_loss(logits_ref, labels)
+        loss_ref.backward()
+        grads_ref = [p.grad.clone() for p in model_ref.parameters()]
+        opt_ref.step()
+        opt_ref.zero_grad()
+
+        train_step_copy = TrainStepModule(model_copy, get_loss)
+        pab = _get_params_and_buffers(train_step_copy)
+        wrapped = run_traced_module(traced_result, pab, (*fwd_args, labels))
+        loss_tr = wrapped[0]
+        grads_tr = wrapped[1:]
+        for p, g in zip(model_copy.parameters(), grads_tr, strict=True):
+            p.grad = g
+        opt_copy.step()
+        opt_copy.zero_grad()
+
+        assert torch.equal(loss_ref, loss_tr), f"Step {step}: loss mismatch"
+        assert all(
+            torch.equal(gr, gt) for gr, gt in zip(grads_ref, grads_tr, strict=True)
+        ), f"Step {step}: grad mismatch"
+
+    return True
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestTraceModels(unittest.TestCase):
+    DEVICE = "cuda"
+    DTYPE = torch.float32
+    BATCH_SIZE = 2
+    SEQ_LEN = 128
+    NUM_STEPS = 5
+    LR = 1e-3
+
+    def setUp(self):
+        torch.manual_seed(42)
+        torch.use_deterministic_algorithms(True)
+
+    def tearDown(self):
+        torch.use_deterministic_algorithms(False)
+
+    def _run_model_test(self, config_cls, model_config, use_attn_masks=False):
+        vocab_size = model_config.vocab_size
+        model_ref = create_model(config_cls, model_config, self.DEVICE, self.DTYPE)
+        model_copy = create_model(config_cls, model_config, self.DEVICE, self.DTYPE)
+        model_copy.load_state_dict(model_ref.state_dict())
+        tokens = torch.randint(
+            0, vocab_size, (self.BATCH_SIZE, self.SEQ_LEN), device=self.DEVICE
+        )
+        labels = torch.randint(
+            0, vocab_size, (self.BATCH_SIZE, self.SEQ_LEN), device=self.DEVICE
+        )
+
+        if use_attn_masks:
+            from torchtitan.models.common.attention import (
+                create_attention_mask,
+                get_causal_mask_mod,
+            )
+
+            attn_masks = create_attention_mask(
+                get_causal_mask_mod(), 1, None, self.SEQ_LEN, self.SEQ_LEN
+            )
+            return _run_bitwise_test(
+                model_ref,
+                model_copy,
+                (tokens, attn_masks),
+                labels,
+                num_steps=self.NUM_STEPS,
+                lr=self.LR,
+            )
+
+        return _run_bitwise_test(
+            model_ref,
+            model_copy,
+            (tokens,),
+            labels,
+            num_steps=self.NUM_STEPS,
+            lr=self.LR,
+        )
+
+    def test_llama3(self):
+        from torchtitan.models.llama3 import llama3_configs, Llama3Model
+
+        self.assertTrue(self._run_model_test(Llama3Model, llama3_configs["debugmodel"]))
+
+    def test_qwen3(self):
+        from torchtitan.models.qwen3 import qwen3_configs
+        from torchtitan.models.qwen3.model import Qwen3Model
+
+        self.assertTrue(self._run_model_test(Qwen3Model, qwen3_configs["debugmodel"]))
+
+    def test_qwen3_moe(self):
+        from torchtitan.models.qwen3 import qwen3_configs
+        from torchtitan.models.qwen3.model import Qwen3Model
+
+        self.assertTrue(
+            self._run_model_test(Qwen3Model, qwen3_configs["debugmodel_moe"])
+        )
+
+    def test_deepseek_v3(self):
+        from torchtitan.models.deepseek_v3 import deepseekv3_configs
+        from torchtitan.models.deepseek_v3.model import DeepSeekV3Model
+
+        self.assertTrue(
+            self._run_model_test(DeepSeekV3Model, deepseekv3_configs["debugmodel"])
+        )
+
+    def test_llama4(self):
+        from torchtitan.models.llama4 import llama4_configs
+        from torchtitan.models.llama4.model import Llama4Model
+
+        self.assertTrue(
+            self._run_model_test(
+                Llama4Model, llama4_configs["debugmodel"], use_attn_masks=True
+            )
+        )
+
+    def test_gpt_oss(self):
+        from torch.nn.attention.flex_attention import and_masks
+
+        from torchtitan.models.common.attention import (
+            create_attention_mask,
+            get_causal_mask_mod,
+            get_sliding_window_mask_mod,
+        )
+        from torchtitan.models.gpt_oss import gptoss_configs
+        from torchtitan.models.gpt_oss.model import GptOssModel
+
+        config = gptoss_configs["debugmodel"]
+        vocab_size = config.vocab_size
+        model_ref = create_model(GptOssModel, config, self.DEVICE, self.DTYPE)
+        model_copy = create_model(GptOssModel, config, self.DEVICE, self.DTYPE)
+        model_copy.load_state_dict(model_ref.state_dict())
+        tokens = torch.randint(
+            0, vocab_size, (self.BATCH_SIZE, self.SEQ_LEN), device=self.DEVICE
+        )
+        labels = torch.randint(
+            0, vocab_size, (self.BATCH_SIZE, self.SEQ_LEN), device=self.DEVICE
+        )
+        causal = get_causal_mask_mod()
+        sw_size = config.layer.attention.sliding_window_size
+        basic_mask = create_attention_mask(causal, 1, None, self.SEQ_LEN, self.SEQ_LEN)
+        sliding_window_mask = create_attention_mask(
+            and_masks(causal, get_sliding_window_mask_mod(sw_size)),
+            1,
+            None,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+        )
+        attn_masks = {
+            "basic_mask": basic_mask,
+            "sliding_window_mask": sliding_window_mask,
+        }
+        self.assertTrue(
+            _run_bitwise_test(
+                model_ref,
+                model_copy,
+                (tokens, attn_masks),
+                labels,
+                num_steps=self.NUM_STEPS,
+                lr=self.LR,
+            )
+        )
 
 
 if __name__ == "__main__":
